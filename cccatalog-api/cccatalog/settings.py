@@ -102,6 +102,7 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
         'rest_framework.renderers.BrowsableAPIRenderer',
+        'rest_framework_xml.renderers.XMLRenderer',
     ),
     'DEFAULT_THROTTLE_CLASSES': (
         'cccatalog.api.utils.throttle.BurstRateThrottle',
@@ -154,15 +155,11 @@ CACHES = {
     }
 }
 
-# Produce thumbnails on-the-fly when HTTPS is not supported.
+# Produce CC-hosted thumbnails dynamically through a proxy.
 PROXY_THUMBS = bool(os.environ.get('PROXY_THUMBS', False))
 THUMBNAIL_PROXY_URL = os.environ.get(
     'THUMBNAIL_PROXY_URL', 'https://localhost:8222'
 )
-
-# Some 3rd party content providers provide low quality or broken thumbnails
-# frequently. We produce our own thumbnails for the worst offenders.
-PROXY_ALL = os.environ.get('PROXY_ALL', 'iha').split(',')
 
 AUTHENTICATION_BACKENDS = (
     'oauth2_provider.backends.OAuth2Backend',

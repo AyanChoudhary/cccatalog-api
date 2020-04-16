@@ -23,6 +23,8 @@ import logging
 import piexif
 import io
 import libxmp
+import requests
+from PIL import Image as img
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ PAGE = 'page'
 PAGESIZE = 'page_size'
 FILTER_DEAD = 'filter_dead'
 QA = 'qa'
+SUGGESTIONS = 'suggestions'
 RESULT_COUNT = 'result_count'
 PAGE_COUNT = 'page_count'
 PAGE_SIZE = 'page_size'
@@ -50,9 +53,9 @@ class SearchImages(APIView):
     Although there may be millions of relevant records, only the most relevant
     several thousand records can be viewed. This is by design: the search
     endpoint should be used to find the top N most relevant results, not for
-    exhaustive search or bulk download of every barely relevant result. As such,
-    the caller should not try to access pages beyond `page_count`, or else the
-    server will reject the query.
+    exhaustive search or bulk download of every barely relevant result.
+    As such, the caller should not try to access pages beyond `page_count`,
+    or else the server will reject the query.
     """
 
     @swagger_auto_schema(operation_id='image_search',
@@ -75,7 +78,7 @@ class SearchImages(APIView):
 
         search_index = 'search-qa' if qa else 'image'
         try:
-            results, page_count, result_count = search_controller.search(
+            results, num_pages, num_results, suggest = search_controller.search(
                 params,
                 search_index,
                 page_size,
@@ -92,11 +95,12 @@ class SearchImages(APIView):
             results, many=True, context=context
         ).data
 
-        if len(results) < page_size and page_count == 0:
-            result_count = len(results)
+        if len(results) < page_size and num_pages == 0:
+            num_results = len(results)
         response_data = {
-            RESULT_COUNT: result_count,
-            PAGE_COUNT: page_count,
+            SUGGESTIONS: suggest,
+            RESULT_COUNT: num_results,
+            PAGE_COUNT: num_pages,
             PAGE_SIZE: len(results),
             RESULTS: serialized_results
         }
@@ -259,3 +263,34 @@ class Watermark(GenericAPIView):
             response = HttpResponse(img_bytes, content_type='image/jpeg')
             _save_wrapper(watermarked, exif_bytes, response)
             return response
+
+
+class OembedView(APIView):
+
+    def get(self, request):
+        url = request.query_params.get('url', '')
+
+        if not url:
+            return Response(status=404, data='Not Found')
+        try:
+            identifier = url.rsplit('/', 1)[1]
+            image_record = Image.objects.get(identifier=identifier)
+        except Image.DoesNotExist:
+            return Response(status=404, data='Not Found')
+        if not image_record.height or image_record.width:
+            image = requests.get(image_record.url)
+            width, height = img.open(io.BytesIO(image.content)).size
+        else:
+            width, height = image_record.width, image_record.height
+        resp = {
+            'version': 1.0,
+            'type': 'photo',
+            'width': width,
+            'height': height,
+            'title': image_record.title,
+            'author_name': image_record.creator,
+            'author_url': image_record.creator_url,
+            'license_url': image_record.license_url
+        }
+
+        return Response(data=resp, status=status.HTTP_200_OK)

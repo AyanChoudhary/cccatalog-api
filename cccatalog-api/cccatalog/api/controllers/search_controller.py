@@ -8,10 +8,9 @@ from cccatalog import settings
 from django.core.cache import cache
 from cccatalog.api.models import ContentProvider
 from rest_framework import serializers
-from cccatalog.settings import THUMBNAIL_PROXY_URL, PROXY_THUMBS, PROXY_ALL
+from cccatalog.settings import THUMBNAIL_PROXY_URL, PROXY_THUMBS
 from cccatalog.api.utils.validate_images import validate_images
 from cccatalog.api.utils.dead_link_mask import get_query_mask, get_query_hash
-from rest_framework.reverse import reverse
 from itertools import accumulate
 from typing import Tuple, List, Optional
 from math import ceil
@@ -120,22 +119,21 @@ def _post_process_results(s, start, end, page_size, search_results,
             res.fields_matched = dir(res.meta.highlight)
         to_validate.append(res.url)
         if PROXY_THUMBS:
-            # Proxy thumbnails from providers who don't provide SSL. We also
-            # have a list of providers that have poor quality or no thumbnails,
-            # so we produce our own on-the-fly.
-            provider = res[PROVIDER]
-            if THUMBNAIL in res and provider not in PROXY_ALL:
+            # Route all images through a dynamically resizing caching proxy.
+            # If a 3rd party thumbnail is available, in order to save limited
+            # bandwidth and memory resources required for resizing, we'll
+            # proxy the 3rd party thumbnail instead of the full-sized image.
+            if THUMBNAIL in res:
                 to_proxy = THUMBNAIL
             else:
                 to_proxy = URL
-            if 'http://' in res[to_proxy] or provider in PROXY_ALL:
-                original = res[to_proxy]
-                secure = '{proxy_url}/{width}/{original}'.format(
-                    proxy_url=THUMBNAIL_PROXY_URL,
-                    width=THUMBNAIL_WIDTH_PX,
-                    original=original
-                )
-                res[THUMBNAIL] = secure
+            original = res[to_proxy]
+            proxied = '{proxy_url}/{width}/{original}'.format(
+                proxy_url=THUMBNAIL_PROXY_URL,
+                width=THUMBNAIL_WIDTH_PX,
+                original=original
+            )
+            res[THUMBNAIL] = proxied
         results.append(res)
 
     if filter_dead:
@@ -226,7 +224,12 @@ def search(search_params, index, page_size, ip, request,
     for tup in filters:
         api_field, elasticsearch_field = tup
         s = _apply_filter(s, search_params, api_field, elasticsearch_field)
-
+    # Get suggestions for any route
+    s = s.suggest(
+        'get_suggestion',
+        '',
+        term={'field': 'creator'}
+    )
     # Hide data sources from the catalog dynamically.
     filter_cache_key = 'filtered_providers'
     filtered_providers = cache.get(key=filter_cache_key)
@@ -252,16 +255,34 @@ def search(search_params, index, page_size, ip, request,
             query=query,
             fields=search_fields
         )
+        # Get suggestions for term query
+        s = s.suggest(
+            'get_suggestion',
+            query,
+            term={'field': 'creator'}
+        )
     else:
         if 'creator' in search_params.data:
             creator = _quote_escape(search_params.data['creator'])
             s = s.query(
                 'simple_query_string', query=creator, fields=['creator']
             )
+            # Get suggestions for creator
+            s = s.suggest(
+                'get_suggestion',
+                creator,
+                term={'field': 'creator'}
+            )
         if 'title' in search_params.data:
             title = _quote_escape(search_params.data['title'])
             s = s.query(
                 'simple_query_string', query=title, fields=['title']
+            )
+            # Get suggestions for title
+            s = s.suggest(
+                'get_suggestion',
+                title,
+                term={'field': 'title'}
             )
         if 'tags' in search_params.data:
             tags = _quote_escape(search_params.data['tags'])
@@ -270,7 +291,12 @@ def search(search_params, index, page_size, ip, request,
                 fields=['tags.name'],
                 query=tags
             )
-
+            # Get suggestions for tags
+            s = s.suggest(
+                'get_suggestion',
+                tags,
+                term={'field': 'tags.name'}
+            )
     # Boost by popularity metrics
     if POPULARITY_BOOST:
         queries = []
@@ -299,7 +325,7 @@ def search(search_params, index, page_size, ip, request,
     s.extra(track_scores=True)
     # Route users to the same Elasticsearch worker node to reduce
     # pagination inconsistencies and increase cache hits.
-    s = s.params(preference=str(ip))
+    s = s.params(preference=str(ip), request_timeout=7)
     # Paginate
     start, end = _get_query_slice(s, page_size, page, filter_dead)
     s = s[start:end]
@@ -317,13 +343,15 @@ def search(search_params, index, page_size, ip, request,
         filter_dead
     )
 
+    suggestion = _query_suggestions(search_response)
+
     result_count, page_count = _get_result_and_page_count(
         search_response,
         results,
         page_size
     )
 
-    return results, page_count, result_count
+    return results, page_count, result_count, suggestion
 
 
 def _validate_provider(input_provider):
@@ -334,6 +362,23 @@ def _validate_provider(input_provider):
             "Provider \'{}\' does not exist.".format(input_provider)
         )
     return input_provider.lower()
+
+
+def _query_suggestions(response: Response):
+    """
+    Get suggestions on a misspelt query
+    """
+    obj_suggestion = response.to_dict()['suggest']
+    if not obj_suggestion['get_suggestion']:
+        suggestion = None
+    else:
+        get_suggestion = obj_suggestion['get_suggestion'][0]
+        suggestions = get_suggestion['options']
+        if not suggestions:
+            suggestion = None
+        else:
+            suggestion = suggestions[0]['text']
+    return suggestion
 
 
 def related_images(uuid, index, request, filter_dead):
